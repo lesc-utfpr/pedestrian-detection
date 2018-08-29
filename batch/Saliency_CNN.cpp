@@ -1,5 +1,5 @@
 #include <iostream>
-
+#define CPU_ONLY
 
 #include "opencv2/objdetect/objdetect.hpp"
 #include <opencv2/core/core.hpp>
@@ -14,6 +14,7 @@
 #include <math.h>
 
 #include <caffe/caffe.hpp>
+//#include <caffe.hpp>
 #include <algorithm>
 #include <iosfwd>
 #include <memory>

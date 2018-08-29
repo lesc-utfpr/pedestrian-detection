@@ -1,0 +1,266 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+#include <cv.h>
+#include <highgui.h>
+#include <pthread.h>
+
+#include "ocvRGBImageTemplate.h"
+#include "Palettes.h"
+#include "SPI.h"
+#include "Lepton_I2C.h"
+
+#define PACKET_SIZE 164
+#define PACKET_SIZE_UINT16 (PACKET_SIZE/2)
+#define PACKETS_PER_FRAME 60
+#define FRAME_SIZE_UINT16 (PACKET_SIZE_UINT16*PACKETS_PER_FRAME)
+#define FPS 27;
+
+#define __DEBUG
+
+/*
+#include "LeptonThread.h"
+#include "MyLabel.h"
+*/
+
+// global variables
+IplImage* mwFLIRImage = 0;	// stores the image read from the FLIR sensor
+pthread_mutex_t mutex_FLIRImage;
+IplImage* mwImage = 0;		// image used to show/scale FLIR image on the main window
+int mwHeight = 100;			// main window heigth
+int mwWidth = 100;			// main window width
+int app_exit = 0;
+
+
+#define W_MAIN "mainWin"
+void buildGUI() {
+	// creating main window
+	cvNamedWindow(W_MAIN, CV_WINDOW_AUTOSIZE); 
+	cvMoveWindow(W_MAIN, 100, 100);
+//	cvResizeWindow(W_MAIN, mwWidth, mwHeight);
+}
+
+void updateWindow() {
+	if (mwImage != 0)
+		cvReleaseImage(&mwImage);
+
+	pthread_mutex_lock(&mutex_FLIRImage); // entering critical region
+	mwImage = cvCreateImage(cvSize(mwWidth, mwHeight), mwFLIRImage->depth, mwFLIRImage->nChannels);
+	cvResize(mwFLIRImage, mwImage);
+	pthread_mutex_unlock(&mutex_FLIRImage); // leaving critical region
+
+	cvShowImage(W_MAIN, mwImage);
+#ifdef DEBUG
+	printf("New image size WxH = %d x %d\n", mwImage->width, mwImage->height);
+#endif
+}
+
+void increaseSizeMainWindow() {
+	mwWidth *= 2;
+	mwHeight *= 2;
+//	updateWindow();
+}
+
+void decreaseSizeMainWindow() {
+	mwWidth /= 2;
+	mwHeight /= 2;
+//	updateWindow();
+}
+
+
+void mySetRGB(IplImage* img, int x, int y, char red, char green, char blue) {
+	int height = img->height;
+	int width = img->width;
+	int step = img->widthStep/sizeof(uchar);
+	int channels = img->nChannels;
+	uchar* data = (uchar *)mwFLIRImage->imageData;
+
+	data[y*step+x*channels] = blue;
+	data[y*step+x*channels+1] = green;
+	data[y*step+x*channels+2] = red;
+}
+
+void loadImage(char * file_name) {
+	mwFLIRImage = cvLoadImage(file_name);
+	mwWidth = mwFLIRImage->width;
+	mwHeight = mwFLIRImage->height;
+}
+
+void createFLIRImage() {
+	mwWidth = 80;
+	mwHeight = 60;
+	mwFLIRImage = cvCreateImage(cvSize(mwWidth, mwHeight), IPL_DEPTH_8U, 3);
+//	loadImage("maw.png");
+	for(int y=mwHeight-1; y >= 0; y--)
+		for(int x=mwWidth-1; x >= 0; x--) {
+//			mySetRGB(mwFLIRImage, x, y, 100, 0, 0);
+			RgbImage  imgA(mwFLIRImage);
+			imgA[y][x].b = 0;
+			imgA[y][x].g = 111;
+			imgA[y][x].r = 0;
+		}
+}
+
+void *readImageFromFLIR(void *ptr) {
+
+	uint8_t result[PACKET_SIZE*PACKETS_PER_FRAME];
+	uint16_t *frameBuffer;
+
+#ifdef DEBUG
+	printf("FLIR image is being read...\n");
+#endif
+
+	while (!app_exit) {
+
+#ifdef DEBUG
+		printf("Reading SPI...");
+#endif
+		if (app_exit) continue;
+		//read data packets from lepton over SPI
+		int resets = 0;
+		for(int j=0;j<PACKETS_PER_FRAME;j++) {
+			//if it's a drop packet, reset j to 0, set to -1 so he'll be at 0 again loop
+#ifdef DEBUG
+			printf("\nRead # %d", j);
+#endif
+			read(spi_cs0_fd, result+sizeof(uint8_t)*PACKET_SIZE*j, sizeof(uint8_t)*PACKET_SIZE);
+			int packetNumber = result[j*PACKET_SIZE+1];
+			if(packetNumber != j) {
+				j = -1;
+				resets += 1;
+				usleep(1000);
+				//Note: we've selected 750 resets as an arbitrary limit, since there should never be 750 "null" packets between two valid transmissions at the current poll rate
+				//By polling faster, developers may easily exceed this count, and the down period between frames may then be flagged as a loss of sync
+				if(resets == 750) {
+					SpiClosePort(0);
+					usleep(750000);
+					SpiOpenPort(0);
+				}
+			}
+		}
+		if(resets >= 30) {
+			//qDebug() << "done reading, resets: " << resets;
+			printf("Done reading, resets: %d", resets);
+		}
+#ifdef DEBUG
+		printf("done.\n");
+#endif
+		if (app_exit) continue;
+
+
+		frameBuffer = (uint16_t *)result;
+		int row, column;
+		uint16_t value;
+		uint16_t minValue = 65535;
+		uint16_t maxValue = 0;
+
+		
+		for(int i=0;i<FRAME_SIZE_UINT16;i++) {
+			//skip the first 2 uint16_t's of every packet, they're 4 header bytes
+			if(i % PACKET_SIZE_UINT16 < 2) {
+				continue;
+			}
+			
+			//flip the MSB and LSB at the last second
+			int temp = result[i*2];
+			result[i*2] = result[i*2+1];
+			result[i*2+1] = temp;
+			
+			value = frameBuffer[i];
+			if(value > maxValue) {
+				maxValue = value;
+			}
+			if(value < minValue) {
+				minValue = value;
+			}
+			column = i % PACKET_SIZE_UINT16 - 2;
+			row = i / PACKET_SIZE_UINT16 ;
+		}
+		if (app_exit) continue;
+
+#ifdef DEBUG
+		printf("Building image...");
+#endif
+		float diff = maxValue - minValue;
+		float scale = 255/diff;
+//		QRgb color;
+
+		
+		pthread_mutex_lock(&mutex_FLIRImage); // entering critical region
+		for(int i=0;i<FRAME_SIZE_UINT16;i++) {
+			if(i % PACKET_SIZE_UINT16 < 2) {
+				continue;
+			}
+			value = (frameBuffer[i] - minValue) * scale;
+			const int *colormap = colormap_ironblack;
+//			color = qRgb(colormap[3*value], colormap[3*value+1], colormap[3*value+2]);
+			column = (i % PACKET_SIZE_UINT16 ) - 2;
+			row = i / PACKET_SIZE_UINT16;
+//			myImage.setPixel(column, row, color);
+			RgbImage  imgA(mwFLIRImage);
+			imgA[row][column].b = colormap[3*value+2];
+			imgA[row][column].g = colormap[3*value+1];
+			imgA[row][column].r = colormap[3*value];
+		}
+		pthread_mutex_unlock(&mutex_FLIRImage); // leasing critical region
+#ifdef DEBUG
+		printf("done.\n");
+#endif
+#ifdef DEBUG
+	printf("FLIR image has been read.\n");
+#endif
+	}
+	pthread_exit(NULL);
+}
+
+int main( int argc, char **argv )
+{
+	// initialize SPI
+	int spi_status = SpiOpenPort(0);
+	if (spi_status != 0) {
+		printf("Problems with SPI ! [%d]", spi_status);
+		exit(-1);
+	}
+	// creating the mutex to control the concurrent access to FLIRImage
+	pthread_mutex_init(&mutex_FLIRImage, NULL);
+
+	// creating the FLIR image
+	//loadImage("maw.png");
+	createFLIRImage(); 
+
+	// creating GUI
+	buildGUI();
+
+	pthread_t t1;
+	pthread_create(&t1, NULL,  readImageFromFLIR, NULL);
+
+	// infinite loop to avoid the program to finish
+	app_exit = 0;
+	while(!app_exit){
+		char key =  cvWaitKey(1);
+		// keyboard commands
+		switch(key){
+		case 27:
+			app_exit = 1;
+			continue;
+		case '+':
+			increaseSizeMainWindow();
+			break;
+		case '-':
+			decreaseSizeMainWindow();
+			break;
+		}
+		updateWindow();
+	}
+
+	// close spi port
+	SpiClosePort(0);	
+	// releasing allocated resources
+	pthread_mutex_destroy(&mutex_FLIRImage);
+	if (mwFLIRImage)
+		cvReleaseImage(&mwFLIRImage);
+	if (mwImage)
+		cvReleaseImage(&mwImage);
+	pthread_exit(NULL);
+}
+
